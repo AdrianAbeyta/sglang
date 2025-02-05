@@ -56,7 +56,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import is_cuda_available, is_hip
+from sglang.srt.utils import is_cuda_available, is_hip, get_load_format
 
 is_hip_ = is_hip()
 
@@ -496,9 +496,59 @@ class DeepseekV2AttentionMLA(nn.Module):
             v_head_dim=self.v_head_dim,
         )
 
-        self.w_kc = None
-        self.w_vc = None
-        self.w_scale = None
+        if get_load_format() == "dummy":
+            for layer_id in range(config.num_hidden_layers):
+                if hasattr(self.kv_b_proj, "qweight"):
+                    # AWQ compatible
+                    w = ops.awq_dequantize(
+                        self.kv_b_proj.qweight,
+                        self.kv_b_proj.scales,
+                        self.kv_b_proj.qzeros,
+                        0,
+                        0,
+                        0,
+                    ).T
+                else:
+                    w = self.kv_b_proj.weight
+                # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
+                # This may affect the accuracy of fp8 model.
+                if hasattr(quant_config, "weight_block_size") and w.dtype in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fnuz,
+                ):
+                    weight_block_size = quant_config.weight_block_size
+                    if weight_block_size is not None:
+                        assert hasattr(self.kv_b_proj, "weight_scale_inv")
+                        if is_hip_:
+                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                                weight=w,
+                                weight_scale=self.kv_b_proj.weight_scale_inv,
+                                input_scale=None,
+                            )
+                        else:
+                            weight = w
+                            weight_scale = self.kv_b_proj.weight_scale_inv
+
+                        w, scale = block_quant_to_tensor_quant(
+                            weight, weight_scale, weight_block_size
+                        )
+                        self.w_scale = scale
+                w_kc, w_vc = w.unflatten(
+                    0, (-1, self.qk_nope_head_dim + self.v_head_dim)
+                ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+                self.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self.w_vc = w_vc.contiguous().transpose(1, 2)
+                if (
+                    hasattr(self.kv_b_proj, "weight_scale")
+                    and self.w_scale is None
+                ):
+                    self.w_scale = self.kv_b_proj.weight_scale
+                    if is_hip_:
+                        self.w_scale *= 2.0
+        else:
+            self.w_kc = None
+            self.w_vc = None
+            self.w_scale = None
 
     def forward(
         self,

@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 import warnings
+import argparse
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
@@ -107,6 +108,12 @@ def enable_show_time_cost():
     global show_time_cost
     show_time_cost = True
 
+def get_load_format() -> str:
+    parser = argparse.ArgumentParser()
+    from sglang.srt.server_args import ServerArgs
+    ServerArgs.add_cli_args(parser)
+    args, unknown = parser.parse_known_args()
+    return args.load_format
 
 class TimeInfo:
     def __init__(self, name, interval=0.1, color=0, indent=0):
